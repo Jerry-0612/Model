@@ -1,0 +1,472 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+import hdbscan
+from sentence_transformers import SentenceTransformer
+import torch
+from typing import List, Optional, Dict, Any
+import warnings
+import os
+warnings.filterwarnings('ignore')
+
+# 可视化相关库（可选）
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+class TextClusterAnalyzer:
+    """
+    使用Hugging Face模型进行文本嵌入，然后使用HDBSCAN进行聚类分析
+    """
+    
+    def __init__(
+        self,
+        model_path: str = None,  # 本地模型路径
+        model_name: str = 'all-MiniLM-L6-v2',  # 模型名称（在线下载时使用）
+        min_cluster_size: int = 5,
+        min_samples: Optional[int] = None,
+        cluster_selection_epsilon: float = 0.0,
+        use_gpu: bool = False,
+        random_state: int = 42
+    ):
+        """
+        初始化文本聚类分析器
+        
+        Args:
+            model_path: 本地模型路径（推荐使用）
+            model_name: Hugging Face模型名称（在线下载时使用）
+            min_cluster_size: HDBSCAN最小聚类大小
+            min_samples: HDBSCAN核心点邻域中的样本数
+            cluster_selection_epsilon: 聚类选择的距离阈值
+            use_gpu: 是否使用GPU加速
+            random_state: 随机种子
+        """
+        self.model_path = model_path
+        self.model_name = model_name
+        self.min_cluster_size = min_cluster_size
+        self.min_samples = min_samples
+        self.cluster_selection_epsilon = cluster_selection_epsilon
+        self.random_state = random_state
+        
+        # 加载模型
+        device = 'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
+        
+        # 优先使用本地模型路径
+        if model_path and os.path.exists(model_path):
+            print(f"从本地路径加载模型: {model_path}")
+            self.model = SentenceTransformer(
+                model_name_or_path=model_path,
+                device=device
+            )
+        elif model_path and not os.path.exists(model_path):
+            print(f"警告: 本地路径不存在 - {model_path}")
+            print(f"将尝试从在线下载模型: {model_name}")
+            self.model = SentenceTransformer(model_name, device=device)
+        else:
+            print(f"正在加载模型 {model_name} 到设备 {device}...")
+            self.model = SentenceTransformer(model_name, device=device)
+        
+        print(f"模型加载完成，嵌入维度: {self.model.get_sentence_embedding_dimension()}")
+        
+        # 初始化HDBSCAN
+        self.clusterer = None
+        self.scaler = StandardScaler()
+        self.pca = None
+        
+    def generate_embeddings(self, texts: List[str], batch_size: int = 32) -> np.ndarray:
+        """
+        生成文本嵌入向量
+        
+        Args:
+            texts: 文本列表
+            batch_size: 批处理大小
+            
+        Returns:
+            嵌入向量矩阵
+        """
+        print(f"正在生成 {len(texts)} 条文本的嵌入向量...")
+        
+        # 编码文本
+        embeddings = self.model.encode(
+            texts,
+            batch_size=batch_size,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=True  # 归一化嵌入向量以提高聚类效果
+        )
+        
+        print(f"嵌入向量维度: {embeddings.shape}")
+        return embeddings
+    
+    def reduce_dimensionality(
+        self, 
+        embeddings: np.ndarray, 
+        n_components: Optional[int] = None,
+        variance_ratio: float = 0.95
+    ) -> np.ndarray:
+        """
+        使用PCA降维以提高聚类效率和效果
+        
+        Args:
+            embeddings: 原始嵌入向量
+            n_components: 降维后的维度，如果为None则根据variance_ratio自动确定
+            variance_ratio: 保留的方差比例
+            
+        Returns:
+            降维后的向量
+        """
+        print(f"正在进行降维... 原始维度: {embeddings.shape[1]}")
+        
+        # 标准化
+        embeddings_scaled = self.scaler.fit_transform(embeddings)
+        
+        # 确定PCA组件数量
+        if n_components is None:
+            max_components = min(embeddings.shape[1], embeddings.shape[0])
+            self.pca = PCA(n_components=max_components, random_state=self.random_state)
+            self.pca.fit(embeddings_scaled)
+            
+            # 计算达到variance_ratio所需的组件数
+            cumulative_variance = np.cumsum(self.pca.explained_variance_ratio_)
+            n_components = np.argmax(cumulative_variance >= variance_ratio) + 1
+            print(f"保留 {variance_ratio*100}% 方差所需维度: {n_components}")
+        
+        # 应用PCA
+        self.pca = PCA(n_components=n_components, random_state=self.random_state)
+        embeddings_reduced = self.pca.fit_transform(embeddings_scaled)
+        
+        print(f"降维后维度: {embeddings_reduced.shape}")
+        return embeddings_reduced
+    
+    def perform_clustering(self, embeddings: np.ndarray) -> np.ndarray:
+        """
+        使用HDBSCAN进行聚类
+        
+        Args:
+            embeddings: 嵌入向量矩阵
+            
+        Returns:
+            聚类标签
+        """
+        print("正在进行HDBSCAN聚类...")
+        
+        # 初始化HDBSCAN
+        self.clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=self.min_cluster_size,
+            min_samples=self.min_samples,
+            cluster_selection_epsilon=self.cluster_selection_epsilon,
+            metric='euclidean',
+            prediction_data=True,
+            gen_min_span_tree=True
+        )
+        
+        # 执行聚类
+        cluster_labels = self.clusterer.fit_predict(embeddings)
+        
+        # 统计聚类结果
+        n_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
+        n_noise = np.sum(cluster_labels == -1)
+        
+        print(f"聚类完成:")
+        print(f"  - 聚类数量: {n_clusters}")
+        print(f"  - 噪声点数量: {n_noise} ({n_noise/len(cluster_labels)*100:.1f}%)")
+        print(f"  - 聚类点数量: {len(cluster_labels) - n_noise}")
+        
+        # 显示各聚类大小
+        cluster_sizes = pd.Series(cluster_labels).value_counts()
+        if -1 in cluster_sizes.index:
+            print(f"  - 各聚类大小:")
+            for label, size in cluster_sizes.items():
+                if label == -1:
+                    print(f"    噪声点: {size}")
+                else:
+                    print(f"    聚类 {label}: {size}")
+        
+        return cluster_labels
+    
+    def analyze_clusters(self, texts: List[str], labels: np.ndarray, top_n: int = 5):
+        """
+        分析聚类结果，提取每个聚类的代表性文本
+        
+        Args:
+            texts: 原始文本列表
+            labels: 聚类标签
+            top_n: 每个聚类的代表性文本数量
+        """
+        print("\n" + "="*60)
+        print("聚类结果分析")
+        print("="*60)
+        
+        # 获取唯一的聚类标签（排除噪声点）
+        unique_labels = sorted(set(labels))
+        if -1 in unique_labels:
+            unique_labels.remove(-1)
+        
+        for label in unique_labels:
+            # 获取该聚类的所有文本
+            cluster_texts = [texts[i] for i, l in enumerate(labels) if l == label]
+            
+            print(f"\n聚类 {label}:")
+            print(f"  文本数量: {len(cluster_texts)}")
+            print(f"  代表性文本 (前{top_n}条):")
+            
+            for i, text in enumerate(cluster_texts[:top_n]):
+                # 截断过长的文本
+                display_text = text if len(text) <= 100 else text[:100] + "..."
+                print(f"    {i+1}. {display_text}")
+        
+        # 如果有噪声点，也进行分析
+        noise_texts = [texts[i] for i, l in enumerate(labels) if l == -1]
+        if noise_texts:
+            print(f"\n噪声点:")
+            print(f"  文本数量: {len(noise_texts)}")
+            print(f"  噪声点示例 (前{top_n}条):")
+            for i, text in enumerate(noise_texts[:top_n]):
+                display_text = text if len(text) <= 100 else text[:100] + "..."
+                print(f"    {i+1}. {display_text}")
+    
+    def visualize_clusters(
+        self, 
+        embeddings: np.ndarray, 
+        labels: np.ndarray,
+        method: str = 'pca'
+    ):
+        """
+        可视化聚类结果
+        
+        Args:
+            embeddings: 嵌入向量矩阵
+            labels: 聚类标签
+            method: 降维方法 ('pca' 或 'tsne')
+        """
+        try:
+            # 降维到2D用于可视化
+            if method == 'pca':
+                pca_2d = PCA(n_components=2, random_state=self.random_state)
+                vis_embeddings = pca_2d.fit_transform(embeddings)
+            else:
+                from sklearn.manifold import TSNE
+                tsne = TSNE(n_components=2, random_state=self.random_state, perplexity=30)
+                vis_embeddings = tsne.fit_transform(embeddings)
+            
+            # 创建可视化
+            plt.figure(figsize=(12, 8))
+            
+            # 获取唯一的标签
+            unique_labels = sorted(set(labels))
+            colors = plt.cm.tab20(np.linspace(0, 1, len(unique_labels)))
+            
+            # 绘制每个聚类的点
+            for i, label in enumerate(unique_labels):
+                mask = labels == label
+                color = colors[i] if label != -1 else 'gray'
+                marker = 'o' if label != -1 else 'x'
+                label_name = f'Cluster {label}' if label != -1 else 'Noise'
+                
+                plt.scatter(
+                    vis_embeddings[mask, 0],
+                    vis_embeddings[mask, 1],
+                    c=[color],
+                    marker=marker,
+                    label=label_name,
+                    alpha=0.7,
+                    s=50
+                )
+            
+            plt.title(f'Text Clustering Results ({method.upper()} visualization)', fontsize=14)
+            plt.xlabel('Component 1', fontsize=12)
+            plt.ylabel('Component 2', fontsize=12)
+            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.show()
+            
+        except Exception as e:
+            print(f"可视化失败: {e}")
+    
+    def save_results(self, texts: List[str], labels: np.ndarray, output_file: str = 'clustering_results.csv'):
+        """
+        保存聚类结果到CSV文件
+        
+        Args:
+            texts: 原始文本列表
+            labels: 聚类标签
+            output_file: 输出文件名
+        """
+        results_df = pd.DataFrame({
+            'text': texts,
+            'cluster_label': labels
+        })
+        
+        # 添加聚类大小信息
+        label_counts = results_df['cluster_label'].value_counts().to_dict()
+        results_df['cluster_size'] = results_df['cluster_label'].map(label_counts)
+        
+        results_df.to_csv(output_file, index=False, encoding='utf-8-sig')
+        print(f"\n结果已保存到: {output_file}")
+        print(f"总文本数: {len(results_df)}")
+        print(f"聚类数: {len(label_counts) - (1 if -1 in label_counts else 0)}")
+        print(f"噪声点数: {label_counts.get(-1, 0)}")
+
+def main():
+    """
+    主函数：演示如何使用TextClusterAnalyzer
+    """
+    
+    # ==================== 配置本地模型路径 ====================
+    # 请修改为您实际的本地模型路径
+    LOCAL_MODEL_PATH = r"C:/Users//Desktop/all-MiniLM-L6-v2"   # ← 修改这里！
+    
+    # 检查路径是否存在
+    if not os.path.exists(LOCAL_MODEL_PATH):
+        print(f"警告: 本地模型路径不存在: {LOCAL_MODEL_PATH}")
+        print("将使用在线模型，或请修改 LOCAL_MODEL_PATH 变量")
+        LOCAL_MODEL_PATH = None
+    
+    # ==================== 示例数据 ====================
+    # 您可以将这里的示例数据替换为您自己的客户文本数据
+    
+    sample_texts = [
+        "这个产品的质量非常好，我很满意",
+        "产品质量很差，完全不符合预期",
+        "客服态度很好，解决问题很及时",
+        "客服态度恶劣，根本不解决问题",
+        "快递速度很快，包装也很完好",
+        "快递太慢了，等了一周才到",
+        "产品性价比很高，会推荐给朋友",
+        "价格太贵了，不值这个价",
+        "安装说明很清晰，自己就能搞定",
+        "安装太复杂了，需要专业人员",
+        "产品功能很强大，满足我的需求",
+        "功能太单一，没有达到预期",
+        "售后服务很到位，主动联系用户",
+        "售后无人回应，体验很差",
+        "网页设计很美观，使用流畅",
+        "界面设计混乱，很难找到想要的功能",
+        "数据很准确，计算速度快",
+        "数据错误很多，计算结果不可信",
+        "操作简单，适合新手使用",
+        "操作复杂，需要培训才能使用"
+    ]
+    
+    # 或者从CSV文件读取数据
+    # df = pd.read_csv('your_customer_data.csv')
+    # texts = df['your_text_column'].tolist()
+    
+    # ==================== 初始化分析器 ====================
+    analyzer = TextClusterAnalyzer(
+        model_path=LOCAL_MODEL_PATH,          # 使用本地模型
+        model_name='all-MiniLM-L6-v2',        # 备用在线模型
+        min_cluster_size=3,                   # 最小聚类大小（根据数据量调整）
+        min_samples=2,                        # 核心点邻域中的最小样本数
+        cluster_selection_epsilon=0.5,        # 聚类选择的距离阈值
+        use_gpu=False,                        # 是否使用GPU
+        random_state=42
+    )
+    
+    # ==================== 执行聚类分析 ====================
+    
+    # 1. 生成嵌入向量
+    embeddings = analyzer.generate_embeddings(sample_texts)
+    
+    # 2. （可选）降维以提高聚类效果
+    # 如果文本量很大，可以考虑降维；如果文本量较小（<1000），可以跳过
+    if len(sample_texts) > 500:
+        embeddings_reduced = analyzer.reduce_dimensionality(embeddings, variance_ratio=0.95)
+    else:
+        embeddings_reduced = embeddings
+        # 仍然进行标准化
+        analyzer.scaler.fit(embeddings)
+        print(f"跳过降维，使用原始嵌入向量: {embeddings.shape}")
+    
+    # 3. 执行HDBSCAN聚类
+    cluster_labels = analyzer.perform_clustering(embeddings_reduced)
+    
+    # 4. 分析结果
+    analyzer.analyze_clusters(sample_texts, cluster_labels, top_n=3)
+    
+    # 5. 可视化（可选）
+    try:
+        # 使用PCA降维到2D进行可视化
+        pca_2d = PCA(n_components=2, random_state=42)
+        vis_embeddings = pca_2d.fit_transform(embeddings_reduced)
+        analyzer.visualize_clusters(vis_embeddings, cluster_labels, method='pca')
+    except Exception as e:
+        print(f"无法显示可视化: {e}")
+    
+    # 6. 保存结果
+    analyzer.save_results(sample_texts, cluster_labels, 'customer_text_clusters.csv')
+    
+    # ==================== 高级功能：对新文本进行预测 ====================
+    print("\n" + "="*60)
+    print("对新文本进行聚类预测示例")
+    print("="*60)
+    
+    new_texts = [
+        "产品很棒，服务也很好",
+        "物流很慢，包装破损"
+    ]
+    
+    # 生成新文本的嵌入向量
+    new_embeddings = analyzer.generate_embeddings(new_texts)
+    
+    # 如果之前做了降维，需要对新的嵌入向量也进行相同的转换
+    if embeddings_reduced.shape[1] != embeddings.shape[1]:
+        new_embeddings_scaled = analyzer.scaler.transform(new_embeddings)
+        new_embeddings_reduced = analyzer.pca.transform(new_embeddings_scaled)
+        new_labels = hdbscan.approximate_predict(analyzer.clusterer, new_embeddings_reduced)[0]
+    else:
+        new_embeddings_scaled = analyzer.scaler.transform(new_embeddings)
+        new_labels = hdbscan.approximate_predict(analyzer.clusterer, new_embeddings_scaled)[0]
+    
+    for text, label in zip(new_texts, new_labels):
+        label_str = f"聚类 {label}" if label != -1 else "噪声点/新类别"
+        print(f"文本: {text}")
+        print(f"预测标签: {label_str}\n")
+
+def quick_test():
+    """
+    快速测试函数：验证模型是否正常加载
+    """
+    print("="*60)
+    print("快速测试模型加载")
+    print("="*60)
+    
+    # 请修改为您的本地模型路径
+    LOCAL_MODEL_PATH = r"C:/Users//Desktop/all-MiniLM-L6-v2" 
+    
+    if os.path.exists(LOCAL_MODEL_PATH):
+        print(f"找到本地模型: {LOCAL_MODEL_PATH}")
+        try:
+            model = SentenceTransformer(LOCAL_MODEL_PATH)
+            print("✅ 模型加载成功！")
+            
+            # 测试编码
+            test_text = "这是一个测试文本"
+            embedding = model.encode(test_text)
+            print(f"✅ 编码测试成功！")
+            print(f"   - 文本: {test_text}")
+            print(f"   - 嵌入维度: {embedding.shape}")
+            print(f"   - 向量前5个值: {embedding[:5]}")
+            
+            return True
+        except Exception as e:
+            print(f"❌ 模型加载失败: {e}")
+            return False
+    else:
+        print(f"❌ 本地模型路径不存在: {LOCAL_MODEL_PATH}")
+        print("请先修改 LOCAL_MODEL_PATH 变量为您的实际模型路径")
+        return False
+
+if __name__ == "__main__":
+    # 先运行快速测试
+    if quick_test():
+        print("\n" + "="*60)
+        print("测试通过，开始主程序...")
+        print("="*60 + "\n")
+        
+        # 运行主程序
+        main()
+    else:
+        print("\n请先确保模型路径正确后再运行主程序")
+        print("您可以在代码中修改 LOCAL_MODEL_PATH 变量")
